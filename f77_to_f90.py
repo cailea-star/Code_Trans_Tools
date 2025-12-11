@@ -12,6 +12,18 @@ F77 转 F90 格式转换脚本
 import re, sys
 
 
+# ============ 工具函数 ============
+
+def is_comment(line):
+    """判断是否为注释行"""
+    return line.lstrip().startswith('!')
+
+
+def ensure_newline(line):
+    """确保行尾有换行符"""
+    return line if line.endswith('\n') else line + '\n'
+
+
 # ============ 第一阶段：符号标准化 ============
 
 def normalize_linenum(line):
@@ -20,80 +32,66 @@ def normalize_linenum(line):
 
 
 def normalize_tab(line):
-    """将TAB展开为空格"""
+    """将TAB展开为空格，第1-6列TAB展开到第6列"""
     if '\t' not in line:
         return line
     result, col = [], 0
     for c in line:
-        if c == '\t':
-            spaces = 6 - col if col < 6 else 1
-            result.append(' ' * spaces)
-            col = 6 if col < 6 else col + 1
-        else:
+        if c != '\t':
             result.append(c)
             col += 1
+        else:
+            spaces = max(1, 6 - col)
+            result.append(' ' * spaces)
+            col = max(6, col + 1)
     return ''.join(result)
 
 
 def normalize_spaces(line):
-    """标准化空格：DO/IF语句、指数格式、GO TO"""
-    if line.lstrip().startswith('!'):
+    """标准化空格：DO语句、指数格式、GOTO"""
+    if is_comment(line):
         return line
-    # DO104N → DO 104 N
     line = re.sub(r'\bDO\s*(\d+)([A-Z])', r'DO \1 \2', line, flags=re.I)
-    # 0.1D 01 → 0.1D01
     line = re.sub(r'(\d)[DE]\s+(\d)', r'\1D\2', line, flags=re.I)
-    # GO TO 标准化
     line = re.sub(r'\bGOTO\b', 'GO TO', line, flags=re.I)
     return line
 
 
 def normalize_indent(line):
     """标准化缩进和标签格式"""
-    if not line.strip() or line.lstrip().startswith('!'):
+    if not line.strip() or is_comment(line):
         return line
     stripped = line.lstrip()
-    leading = len(line) - len(stripped)
-    # 标签行：数字+空格+代码
+    # 标签行格式化
     m = re.match(r'^(\d+)(\s+)(\S.*)$', stripped)
     if m:
-        label, _, rest = m.groups()
-        nl = '\n' if line.endswith('\n') else ''
-        return f'   {label} {rest.rstrip()}' + nl
-    # 过深缩进标准化为6列
-    if leading > 10:
-        nl = '\n' if line.endswith('\n') else ''
-        return '      ' + stripped.rstrip() + nl
+        return ensure_newline(f'   {m.group(1)} {m.group(3).rstrip()}')
+    # 过深缩进标准化
+    if len(line) - len(stripped) > 10:
+        return ensure_newline('      ' + stripped.rstrip())
     return line
 
 
 def normalize_keywords(line):
     """关键字转为大写"""
-    if line.lstrip().startswith('!'):
+    if is_comment(line):
         return line
-    kws = ['function', 'subroutine', 'implicit', 'do', 'end', 'if', 'then',
-           'else', 'endif', 'return', 'go to', 'call', 'continue', 'format',
-           'write', 'read', 'data', 'dimension', 'common', 'parameter', 'entry']
-    for kw in kws:
-        line = re.sub(r'\b' + kw + r'\b', kw.upper(), line, flags=re.I)
-    return line
+    kws = 'function|subroutine|implicit|do|end|if|then|else|endif|return|go to|call|continue|format|write|read|data|dimension|common|parameter|entry'
+    return re.sub(r'\b(' + kws + r')\b', lambda m: m.group().upper(), line, flags=re.I)
 
 
 # ============ 第二阶段：语法转换 ============
 
 def conv_comment(line):
     """第1列C/c/*/!转为注释"""
-    if line and line[0] in 'Cc*!':
-        return '!' + line[1:]
-    return line
+    return '!' + line[1:] if line and line[0] in 'Cc*!' else line
 
 
 def conv_type(line):
     """转换数据类型 REAL*8/COMPLEX*16"""
     line = re.sub(r'\bREAL\*8\b', 'REAL(8)', line, flags=re.I)
     line = re.sub(r'\bCOMPLEX\*16\b', 'COMPLEX(8)', line, flags=re.I)
-    line = re.sub(r'(IMPLICIT\s+)REAL\*8', r'\1REAL(8)', line, flags=re.I)
-    return line
+    return re.sub(r'(IMPLICIT\s+)REAL\*8', r'\1REAL(8)', line, flags=re.I)
 
 
 def conv_hollerith(line):
@@ -101,21 +99,20 @@ def conv_hollerith(line):
     result, i = [], 0
     while i < len(line):
         m = re.match(r'(\d+)H', line[i:])
-        if m:
+        if m and i + len(m.group(0)) + int(m.group(1)) <= len(line):
             n = int(m.group(1))
             start = i + len(m.group(0))
-            if start + n <= len(line):
-                text = line[start:start+n].replace("'", "''")
-                result.append("'" + text + "'")
-                i = start + n
-                continue
-        result.append(line[i])
-        i += 1
+            text = line[start:start+n].replace("'", "''")
+            result.append(f"'{text}'")
+            i = start + n
+        else:
+            result.append(line[i])
+            i += 1
     return ''.join(result)
 
 
 def conv_format(line):
-    """修复FORMAT语句问题"""
+    """修复FORMAT语句开头逗号"""
     return re.sub(r'(FORMAT\s*\()\s*,', r'\1', line, flags=re.I)
 
 
@@ -126,84 +123,131 @@ def conv_pause(line):
 
 def conv_end(line):
     """标准化END语句"""
-    if re.match(r'^\s*end\s*$', line, re.I):
-        return '      END\n'
-    return line
+    return '      END\n' if re.match(r'^\s*end\s*$', line, re.I) else line
 
 
 def conv_arith_if(lines):
     """算术IF转换为IF-GOTO结构"""
+    pattern = re.compile(r'^(\s*)(\d*\s*)IF\s*\((.+)\)\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*$', re.I)
     result = []
     for line in lines:
-        m = re.match(r'^(\s*)(\d*\s*)IF\s*\((.+)\)\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*$', line, re.I)
-        if m:
-            ind, lab, expr, l1, l2, l3 = m.groups()
-            base = ind + lab
-            if l1 == l2 == l3:
-                result.append(f"{base}GO TO {l1}\n")
-            elif l1 == l2:
-                result.append(f"{base}IF (({expr}) .GT. 0) GO TO {l3}\n")
-                result.append(f"{ind}      GO TO {l1}\n")
-            elif l2 == l3:
-                result.append(f"{base}IF (({expr}) .LT. 0) GO TO {l1}\n")
-                result.append(f"{ind}      GO TO {l2}\n")
-            elif l1 == l3:
-                result.append(f"{base}IF (({expr}) .EQ. 0) GO TO {l2}\n")
-                result.append(f"{ind}      GO TO {l1}\n")
-            else:
-                result.append(f"{base}IF (({expr}) .LT. 0) GO TO {l1}\n")
-                result.append(f"{ind}      IF (({expr}) .EQ. 0) GO TO {l2}\n")
-                result.append(f"{ind}      GO TO {l3}\n")
-        else:
+        m = pattern.match(line)
+        if not m:
             result.append(line)
+            continue
+        ind, lab, expr, l1, l2, l3 = m.groups()
+        base, pad = ind + lab, ind + '      '
+        result.extend(_gen_arith_if(base, pad, expr, l1, l2, l3))
     return result
+
+
+def _gen_arith_if(base, pad, expr, l1, l2, l3):
+    """生成算术IF的等价IF-GOTO代码"""
+    if l1 == l2 == l3:
+        return [f"{base}GO TO {l1}\n"]
+    if l1 == l2:
+        return [f"{base}IF (({expr}) .GT. 0) GO TO {l3}\n", f"{pad}GO TO {l1}\n"]
+    if l2 == l3:
+        return [f"{base}IF (({expr}) .LT. 0) GO TO {l1}\n", f"{pad}GO TO {l2}\n"]
+    if l1 == l3:
+        return [f"{base}IF (({expr}) .EQ. 0) GO TO {l2}\n", f"{pad}GO TO {l1}\n"]
+    return [f"{base}IF (({expr}) .LT. 0) GO TO {l1}\n",
+            f"{pad}IF (({expr}) .EQ. 0) GO TO {l2}\n", f"{pad}GO TO {l3}\n"]
 
 
 def conv_continuation(lines):
     """处理续行：第1列数字或第6列非空字符"""
     result = []
     for line in lines:
-        if line.lstrip().startswith('!'):
-            result.append(line)
-        elif line and line[0].isdigit():
-            # 第1列数字表示续行
-            content = line[1:].lstrip()
-            if content.strip() and result and result[-1].strip():
-                result[-1] = result[-1].rstrip('\n') + ' &\n'
-                result.append('      ' + content)
-        elif len(line) > 5 and line[5] not in (' ', '0', '\n'):
-            # 第6列非空表示续行
-            label = line[:5].strip()
-            if label and label.isdigit():
-                result.append(line)  # 标签行保持原样
-            else:
-                if result and result[-1].strip():
-                    result[-1] = result[-1].rstrip('\n') + ' &\n'
-                result.append('      ' + line[6:])
+        cont_line = _get_continuation(line, result)
+        if cont_line:
+            result[-1] = result[-1].rstrip('\n') + ' &\n'
+            result.append(cont_line)
         else:
             result.append(line)
     return result
+
+
+def _get_continuation(line, result):
+    """检查并返回续行内容，非续行返回None"""
+    if is_comment(line) or not result or not result[-1].strip():
+        return None
+    # 第1列数字表示续行
+    if line and line[0].isdigit():
+        content = line[1:].lstrip()
+        return '      ' + content if content.strip() else None
+    # 第6列非空表示续行（排除标签行）
+    if len(line) > 5 and line[5] not in (' ', '0', '\n'):
+        label = line[:5].strip()
+        if not (label and label.isdigit()):
+            return '      ' + line[6:]
+    return None
+
+
+def fix_do_loops(lines):
+    """修复DO循环：共享标签分配新标签，非CONTINUE终止转为CONTINUE"""
+    ctx = {'result': [], 'new_label': 9000, 'do_stack': [], 'pending': {}}
+    for line in lines:
+        if not _handle_do_stmt(line, ctx) and not _handle_label_stmt(line, ctx):
+            ctx['result'].append(line)
+    return ctx['result']
+
+
+def _handle_do_stmt(line, ctx):
+    """处理DO语句，共享标签分配新标签"""
+    m = re.match(r'^(\s*)DO\s+(\d+)(\s+.+)$', line, re.I)
+    if not m:
+        return False
+    indent, label, rest = m.groups()
+    if label in ctx['do_stack']:
+        ctx['new_label'] += 1
+        new_lab = str(ctx['new_label'])
+        ctx['result'].append(f"{indent}DO {new_lab}{rest}\n")
+        ctx['pending'][new_lab] = label
+        ctx['do_stack'].append(new_lab)
+    else:
+        ctx['do_stack'].append(label)
+        ctx['result'].append(line)
+    return True
+
+
+def _handle_label_stmt(line, ctx):
+    """处理标签语句，修复非CONTINUE终止"""
+    m = re.match(r'^(\s*)(\d+)(\s+)(\S.*)$', line)
+    if not m:
+        return False
+    indent, label, sp, stmt = m.groups()
+    # 插入pending的CONTINUE
+    for nl, ol in list(ctx['pending'].items()):
+        if ol == label:
+            ctx['result'].append(f'   {nl} CONTINUE\n')
+            del ctx['pending'][nl]
+            if nl in ctx['do_stack']:
+                ctx['do_stack'].remove(nl)
+    # 非CONTINUE终止转为CONTINUE
+    if label in ctx['do_stack'] and not stmt.strip().upper().startswith('CONTINUE'):
+        ctx['result'].append(f'{indent}  {sp}{stmt}' + ('' if stmt.endswith('\n') else '\n'))
+        ctx['result'].append(f'   {label} CONTINUE\n')
+    else:
+        ctx['result'].append(line)
+    while label in ctx['do_stack']:
+        ctx['do_stack'].remove(label)
+    return True
 
 
 # ============ 第三阶段：后处理 ============
 
 def post_comment_after_end(lines):
     """将最后一个END后的内容转为注释"""
-    last_end = -1
-    for i, line in enumerate(lines):
-        if re.match(r'^\s*END\s*$', line, re.I):
-            last_end = i
-    if last_end >= 0:
-        for i in range(last_end + 1, len(lines)):
-            if lines[i].strip() and not lines[i].lstrip().startswith('!'):
-                lines[i] = '! ' + lines[i]
+    last_end = max((i for i, l in enumerate(lines) if re.match(r'^\s*END\s*$', l, re.I)), default=-1)
+    for i in range(last_end + 1, len(lines)):
+        if lines[i].strip() and not is_comment(lines[i]):
+            lines[i] = '! ' + lines[i]
     return lines
 
 
 def post_file_header(lines):
     """文件头非代码行转为注释"""
-    if not lines:
-        return lines
     for i in range(min(3, len(lines))):
         if lines[i].strip() and not lines[i].lstrip().startswith(('!', 'IMPLICIT', 'PROGRAM')):
             lines[i] = '! ' + lines[i]
@@ -232,7 +276,8 @@ def process(inf, outf):
     lines = [conv_pause(l) for l in lines]          # PAUSE转PRINT
     lines = [conv_end(l) for l in lines]            # END语句标准化
     lines = conv_arith_if(lines)                    # 算术IF转IF-GOTO
-    lines = conv_continuation(lines)               # 续行处理
+    lines = conv_continuation(lines)                # 续行处理
+    lines = fix_do_loops(lines)                     # 修复DO循环结构
     
     # === 第三阶段：后处理 ===
     lines = post_comment_after_end(lines)           # END后内容注释化
